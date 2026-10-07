@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-SNkG1ce4jKh9evZbnHi42CRcrZqYXhtlx1Ob2cGk8SI='; style-src 'sha256-lwA1xuVHqkaw7/CBrWTFoNf/hlSSZOn7oNk/Jnx9TpA='; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>age encrypt</title>
+<style>
+:root { color-scheme: light; --bg: #f6f1e4; --fg: #2a2824; --field: #fffdf7; --line: #d6cfbd; }
+@media (prefers-color-scheme: dark) {
+  :root { color-scheme: dark; --bg: #2e3033; --fg: #e6e3dc; --field: #25272a; --line: #4a4d52; }
+  :root:has(#theme:checked) { color-scheme: light; --bg: #f6f1e4; --fg: #2a2824; --field: #fffdf7; --line: #d6cfbd; }
+}
+@media (prefers-color-scheme: light) {
+  :root:has(#theme:checked) { color-scheme: dark; --bg: #2e3033; --fg: #e6e3dc; --field: #25272a; --line: #4a4d52; }
+}
+body { max-width: 70ch; margin: 0 auto; padding: 3em 1em; font: 1.1rem/1.6 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+h1, h2 { line-height: 1.2; }
+h2 { margin-top: 2em; }
+label { display: block; margin-top: 1em; }
+textarea, input[type=text] { width: 100%; box-sizing: border-box; padding: .5em; font: .85rem ui-monospace, monospace; color: inherit; background: var(--field); border: 1px solid var(--line); border-radius: 4px; }
+button { font: inherit; padding: .4em 1.2em; }
+[role=status] { font-size: .9rem; opacity: .75; }
+#theme-switch { position: absolute; top: .5em; right: 1em; margin: 0; font-size: 1.3rem; cursor: pointer; opacity: .6; }
+#theme-switch:hover, #theme-switch:has(:focus-visible) { opacity: 1; }
+#theme { position: absolute; opacity: 0; }
+</style>
+</head>
+<body>
+<main>
+<label id="theme-switch" title="Switch light / dark"><input id="theme" type="checkbox">&#9680;</label>
+<h1>age encrypt</h1>
+<p>Encrypts one secret to the recipients you list below. This page cannot decrypt, makes no network requests and stores nothing.</p>
+
+<h2>Recipients</h2>
+<textarea id="recipients" rows="8" spellcheck="false" autocomplete="off" placeholder="One recipient per line: age1... or age1yubikey1...  Lines starting with # are comments."></textarea>
+<label for="recipients-file">Or load the list from a file</label>
+<input id="recipients-file" type="file">
+<p id="recipient-status" role="status"></p>
+
+<h2>Secret</h2>
+<label for="label">Label (becomes the file name)</label>
+<input id="label" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="bank-example">
+<label for="secret">Secret</label>
+<textarea id="secret" rows="6" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+<label for="secret-file">Or encrypt a file, byte for byte</label>
+<input id="secret-file" type="file">
+<label><input id="pad" type="checkbox" checked> Hide the length of a typed secret (pad with trailing newlines to a multiple of 256 bytes)</label>
+<p><button id="encrypt" type="button">Encrypt</button></p>
+<p id="status" role="status"></p>
+
+<h2>Output</h2>
+<textarea id="output" rows="12" readonly spellcheck="false"></textarea>
+<p>
+<button id="download" type="button" disabled>Download</button>
+<button id="copy" type="button" disabled>Copy</button>
+</p>
+<p>Decrypt outside the browser: <code>age -d -i IDENTITY-FILE LABEL.age</code></p>
+
+<h2>How this uses a YubiKey</h2>
+<p>There are two ways to encrypt with a YubiKey. This page does the first and not the second.</p>
+<p><strong>PIV, as used by age-plugin-yubikey (this page).</strong> The YubiKey holds a P-256 private key in one of its PIV slots. The plugin had the YubiKey generate that key on the device, and PIV has no command to read a private key back out, so it has never left the device. What you paste above, <code>age1yubikey1...</code>, is only the matching public key.</p>
+<ul>
+<li>Encrypting needs the public key and nothing else. The YubiKey does not have to be plugged in, and nobody is asked for a PIN or a touch.</li>
+<li>Decrypting needs the YubiKey itself, its PIN and a touch, because the private-key step runs inside the device. A browser cannot talk to the PIV side of a YubiKey, so this page could not decrypt even if it tried. That is done with <code>age</code> and <code>age-plugin-yubikey</code> in a terminal.</li>
+<li>So a page like this one, even a tampered copy, can see a secret while you type it but can never read back the ones you already encrypted.</li>
+</ul>
+<p><strong>WebAuthn PRF, also called FIDO2 hmac-secret (not this page).</strong> Here the browser asks the YubiKey to derive a secret key from a credential, and the YubiKey hands that key to the web page. The page then encrypts and decrypts with it.</p>
+<ul>
+<li>It is one shared key, not a public and private pair, so the YubiKey must be present and touched to encrypt as well as to decrypt.</li>
+<li>The credential stays on the device, but the derived key is given to the page. Any page that can encrypt this way can also decrypt, and so can whatever else is running in that page.</li>
+<li>It is more convenient, since everything happens in the browser. It is also why this page does not offer it: the point here is that the browser never holds anything that can decrypt.</li>
+</ul>
+</main>
+<script>
+"use strict";
+
+// ---------- bytes ----------
+
+const utf8 = (s) => new TextEncoder().encode(s);
+
+function concat(...parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function base64(bytes, padded) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  s = btoa(s);
+  return padded ? s : s.replace(/=+$/, "");
+}
+
+const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
+// ---------- bech32 (decode only) ----------
+
+const BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const BECH32_GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+
+function bech32Decode(str) {
+  if (str !== str.toLowerCase()) throw new Error("must be lower case");
+  const pos = str.lastIndexOf("1");
+  if (pos < 1 || pos + 7 > str.length) throw new Error("not bech32");
+  const hrp = str.slice(0, pos);
+  const words = [];
+  for (const c of str.slice(pos + 1)) {
+    const v = BECH32_ALPHABET.indexOf(c);
+    if (v < 0) throw new Error("bad character");
+    words.push(v);
+  }
+
+  let chk = 1;
+  const feed = (v) => {
+    const high = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((high >>> i) & 1) chk ^= BECH32_GENERATOR[i];
+  };
+  for (const c of hrp) feed(c.charCodeAt(0) >>> 5);
+  feed(0);
+  for (const c of hrp) feed(c.charCodeAt(0) & 31);
+  for (const w of words) feed(w);
+  if (chk !== 1) throw new Error("bad checksum");
+
+  // Regroup 5-bit words into bytes; the last 6 words are the checksum.
+  const out = [];
+  let acc = 0, bits = 0;
+  for (const w of words.slice(0, -6)) {
+    acc = (acc << 5) | w;
+    bits += 5;
+    if (bits >= 8) { bits -= 8; out.push((acc >>> bits) & 0xff); }
+    acc &= (1 << bits) - 1;
+  }
+  if (bits >= 5 || acc !== 0) throw new Error("bad padding");
+  return { hrp, bytes: Uint8Array.from(out) };
+}
+
+// ---------- ChaCha20-Poly1305 (RFC 8439, no associated data) ----------
+
+const le32 = (b, i) => b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24);
+const rotl = (v, n) => (v << n) | (v >>> (32 - n));
+
+function chacha20Block(key, nonce, counter) {
+  const s = new Uint32Array(16);
+  s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
+  for (let i = 0; i < 8; i++) s[4 + i] = le32(key, 4 * i);
+  s[12] = counter;
+  for (let i = 0; i < 3; i++) s[13 + i] = le32(nonce, 4 * i);
+
+  const x = s.slice();
+  const quarter = (a, b, c, d) => {
+    x[a] += x[b]; x[d] = rotl(x[d] ^ x[a], 16);
+    x[c] += x[d]; x[b] = rotl(x[b] ^ x[c], 12);
+    x[a] += x[b]; x[d] = rotl(x[d] ^ x[a], 8);
+    x[c] += x[d]; x[b] = rotl(x[b] ^ x[c], 7);
+  };
+  for (let i = 0; i < 10; i++) {
+    quarter(0, 4, 8, 12); quarter(1, 5, 9, 13); quarter(2, 6, 10, 14); quarter(3, 7, 11, 15);
+    quarter(0, 5, 10, 15); quarter(1, 6, 11, 12); quarter(2, 7, 8, 13); quarter(3, 4, 9, 14);
+  }
+
+  const out = new Uint8Array(64);
+  for (let i = 0; i < 16; i++) {
+    const v = (x[i] + s[i]) >>> 0;
+    out[4 * i] = v; out[4 * i + 1] = v >>> 8; out[4 * i + 2] = v >>> 16; out[4 * i + 3] = v >>> 24;
+  }
+  return out;
+}
+
+function chacha20Xor(key, nonce, counter, data) {
+  const out = new Uint8Array(data.length);
+  for (let off = 0; off < data.length; off += 64) {
+    const block = chacha20Block(key, nonce, counter++);
+    for (let i = 0; i < 64 && off + i < data.length; i++) out[off + i] = data[off + i] ^ block[i];
+  }
+  return out;
+}
+
+function poly1305(key, msg) {
+  const le = (bytes) => {
+    let n = 0n;
+    for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]);
+    return n;
+  };
+  const p = (1n << 130n) - 5n;
+  const r = le(key.subarray(0, 16)) & 0x0ffffffc0ffffffc0ffffffc0fffffffn;
+  const s = le(key.subarray(16, 32));
+  let acc = 0n;
+  for (let i = 0; i < msg.length; i += 16) {
+    const block = msg.subarray(i, i + 16);
+    acc = ((acc + le(block) + (1n << BigInt(8 * block.length))) * r) % p;
+  }
+  let tag = (acc + s) & ((1n << 128n) - 1n);
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) { out[i] = Number(tag & 0xffn); tag >>= 8n; }
+  return out;
+}
+
+// Returns ciphertext || 16-byte tag.
+function chacha20poly1305Seal(key, nonce, plaintext) {
+  const oneTimeKey = chacha20Block(key, nonce, 0).subarray(0, 32);
+  const ct = chacha20Xor(key, nonce, 1, plaintext);
+  const pad = new Uint8Array((16 - (ct.length % 16)) % 16);
+  const lengths = new Uint8Array(16); // 8 bytes of AD length (zero), 8 bytes of ciphertext length
+  new DataView(lengths.buffer).setUint32(8, ct.length, true);
+  return concat(ct, poly1305(oneTimeKey, concat(ct, pad, lengths)));
+}
+
+// ---------- WebCrypto helpers ----------
+
+async function sha256(data) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+}
+
+async function hkdf(ikm, salt, info) {
+  const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  const params = { name: "HKDF", hash: "SHA-256", salt, info: utf8(info) };
+  return new Uint8Array(await crypto.subtle.deriveBits(params, key, 256));
+}
+
+async function hmac(keyBytes, data) {
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
+}
+
+// ---------- age recipient stanzas ----------
+
+function stanza(args, body) {
+  const b64 = base64(body);
+  let text = "-> " + args.join(" ") + "\n";
+  // 64-column lines; the last line must be shorter than 64, so it may be empty.
+  for (let i = 0; i <= b64.length; i += 64) text += b64.slice(i, i + 64) + "\n";
+  return text;
+}
+
+// Native age recipient: age1...
+async function wrapX25519(recipient, fileKey) {
+  const theirs = await crypto.subtle.importKey("raw", recipient, "X25519", true, []);
+  const ours = await crypto.subtle.generateKey("X25519", true, ["deriveBits"]);
+  const share = new Uint8Array(await crypto.subtle.exportKey("raw", ours.publicKey));
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: theirs }, ours.privateKey, 256));
+  if (shared.every((b) => b === 0)) throw new Error("low order X25519 recipient");
+  const key = await hkdf(shared, concat(share, recipient), "age-encryption.org/v1/X25519");
+  return stanza(["X25519", base64(share)], chacha20poly1305Seal(key, new Uint8Array(12), fileKey));
+}
+
+const P256_P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+const P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
+
+// 33-byte compressed point -> 65-byte uncompressed point (WebCrypto only takes the latter).
+function p256Decompress(point) {
+  if (point.length !== 33 || (point[0] !== 2 && point[0] !== 3)) throw new Error("not a compressed P-256 point");
+  const x = BigInt("0x" + hex(point.subarray(1)));
+  if (x >= P256_P) throw new Error("not a P-256 point");
+  const y2 = (((x * x * x - 3n * x + P256_B) % P256_P) + P256_P) % P256_P;
+  // p = 3 mod 4, so a square root of y2 is y2^((p+1)/4).
+  let y = 1n;
+  for (let base = y2, e = (P256_P + 1n) / 4n; e > 0n; e >>= 1n, base = (base * base) % P256_P) {
+    if (e & 1n) y = (y * base) % P256_P;
+  }
+  if ((y * y) % P256_P !== y2) throw new Error("not a P-256 point");
+  if (Number(y & 1n) !== (point[0] & 1)) y = P256_P - y;
+  const out = new Uint8Array(65);
+  out[0] = 4;
+  out.set(point.subarray(1), 1);
+  for (let i = 64; i > 32; i--) { out[i] = Number(y & 0xffn); y >>= 8n; }
+  return out;
+}
+
+// age-plugin-yubikey recipient: age1yubikey1... (a compressed P-256 public key)
+async function wrapYubikey(recipient, fileKey) {
+  const curve = { name: "ECDH", namedCurve: "P-256" };
+  const theirs = await crypto.subtle.importKey("raw", p256Decompress(recipient), curve, true, []);
+  const ours = await crypto.subtle.generateKey(curve, true, ["deriveBits"]);
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", ours.publicKey));
+  const share = concat([2 | (raw[64] & 1)], raw.subarray(1, 33));
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: theirs }, ours.privateKey, 256));
+  const key = await hkdf(shared, concat(share, recipient), "piv-p256");
+  const tag = (await sha256(recipient)).subarray(0, 4);
+  return stanza(["piv-p256", base64(tag), base64(share)], chacha20poly1305Seal(key, new Uint8Array(12), fileKey));
+}
+
+async function parseRecipient(str) {
+  const { hrp, bytes } = bech32Decode(str);
+  if (hrp === "age" && bytes.length === 32) {
+    return { kind: "X25519", id: str.slice(0, 12), wrap: (fileKey) => wrapX25519(bytes, fileKey) };
+  }
+  if (hrp === "age1yubikey" && bytes.length === 33) {
+    p256Decompress(bytes);
+    // The id is the tag age-plugin-yubikey uses to name the identity.
+    const id = hex((await sha256(bytes)).subarray(0, 4));
+    return { kind: "YubiKey", id, wrap: (fileKey) => wrapYubikey(bytes, fileKey) };
+  }
+  throw new Error("unsupported recipient type");
+}
+
+// One recipient per line; blank lines and # comments are skipped.
+async function parseRecipients(text) {
+  const out = [];
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || line.startsWith("#")) continue;
+    try {
+      out.push(await parseRecipient(line));
+    } catch (e) {
+      throw new Error("recipients line " + (i + 1) + ": " + e.message);
+    }
+  }
+  return out;
+}
+
+// ---------- age file format (encrypt only) ----------
+
+async function ageEncrypt(recipients, plaintext) {
+  if (recipients.length === 0) throw new Error("no recipients");
+  const fileKey = crypto.getRandomValues(new Uint8Array(16));
+
+  let header = "age-encryption.org/v1\n";
+  for (const r of recipients) header += await r.wrap(fileKey);
+  header += "---";
+  const mac = await hmac(await hkdf(fileKey, new Uint8Array(0), "header"), utf8(header));
+
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const payloadKey = await hkdf(fileKey, nonce, "payload");
+  const parts = [utf8(header + " " + base64(mac) + "\n"), nonce];
+
+  // 64 KiB chunks. Chunk nonce: 11-byte big-endian counter, then 1 for the last chunk.
+  const chunkSize = 65536;
+  const chunkNonce = new Uint8Array(12);
+  for (let off = 0, i = 0; ; off += chunkSize, i++) {
+    const last = off + chunkSize >= plaintext.length;
+    new DataView(chunkNonce.buffer).setUint32(7, i);
+    chunkNonce[11] = last ? 1 : 0;
+    parts.push(chacha20poly1305Seal(payloadKey, chunkNonce, plaintext.subarray(off, off + chunkSize)));
+    if (last) break;
+  }
+  return concat(...parts);
+}
+
+function armor(bytes) {
+  const b64 = base64(bytes, true);
+  let out = "-----BEGIN AGE ENCRYPTED FILE-----\n";
+  for (let i = 0; i < b64.length; i += 64) out += b64.slice(i, i + 64) + "\n";
+  return out + "-----END AGE ENCRYPTED FILE-----\n";
+}
+
+// Trailing newlines up to the next multiple of 256 bytes, so the file size hides the length.
+function padPlaintext(bytes) {
+  const out = new Uint8Array(Math.max(1, Math.ceil(bytes.length / 256)) * 256).fill(10);
+  out.set(bytes);
+  return out;
+}
+
+// ---------- page ----------
+
+const el = (id) => document.getElementById(id);
+let result = null;
+
+async function showRecipients() {
+  try {
+    const list = await parseRecipients(el("recipients").value);
+    el("recipient-status").textContent = list.length + " recipient(s)" + (list.length ? ": " : "") + list.map((r) => r.kind + " " + r.id).join(", ");
+  } catch (e) {
+    el("recipient-status").textContent = e.message;
+  }
+}
+el("recipients").addEventListener("input", showRecipients);
+el("recipients-file").addEventListener("change", async () => {
+  const file = el("recipients-file").files[0];
+  if (!file) return;
+  el("recipients").value = await file.text();
+  showRecipients();
+});
+showRecipients();
+
+el("encrypt").addEventListener("click", async () => {
+  try {
+    const recipients = await parseRecipients(el("recipients").value);
+    const file = el("secret-file").files[0];
+    const label = el("label").value.trim() || (file ? file.name : "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(label)) throw new Error("label: use letters, digits, dot, dash, underscore");
+    if (file && el("secret").value) throw new Error("a file is chosen and a secret is typed; empty the secret box, or reload the page to drop the file");
+    if (!file && !el("secret").value) throw new Error("secret is empty");
+    // A file is encrypted exactly as it is. Padding would change its bytes.
+    let plaintext;
+    if (file) plaintext = new Uint8Array(await file.arrayBuffer());
+    else if (el("pad").checked) plaintext = padPlaintext(utf8(el("secret").value));
+    else plaintext = utf8(el("secret").value);
+    const text = armor(await ageEncrypt(recipients, plaintext));
+    el("secret").value = "";
+    el("secret-file").value = "";
+    el("output").value = text;
+    result = { name: label + ".age", text };
+    el("download").disabled = false;
+    el("copy").disabled = false;
+    el("status").textContent = "Encrypted " + result.name + " to " + recipients.length + " recipient(s). Secret cleared.";
+  } catch (e) {
+    el("status").textContent = "Error: " + e.message;
+  }
+});
+
+el("download").addEventListener("click", async () => {
+  const { name, text } = result;
+  // Chrome and Edge can ask where to save. Elsewhere, or if that fails, do an ordinary download.
+  if (typeof showSaveFilePicker === "function") {
+    try {
+      const handle = await showSaveFilePicker({ suggestedName: name });
+      const stream = await handle.createWritable();
+      await stream.write(text);
+      await stream.close();
+      el("status").textContent = "Saved " + handle.name + ".";
+      return;
+    } catch (e) {
+      if (e.name === "AbortError") return; // the dialog was cancelled
+    }
+  }
+  const url = URL.createObjectURL(new Blob([text], { type: "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+el("copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(result.text);
+    el("status").textContent = "Copied " + result.name + ".";
+  } catch (e) {
+    el("output").select();
+    el("status").textContent = "Clipboard unavailable. Output selected, copy it by hand.";
+  }
+});
+</script>
+</body>
+</html>

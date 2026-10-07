@@ -1,0 +1,18 @@
+:root { color-scheme: light; --bg: #f6f1e4; --fg: #2a2824; --field: #fffdf7; --line: #d6cfbd; }
+@media (prefers-color-scheme: dark) {
+  :root { color-scheme: dark; --bg: #2e3033; --fg: #e6e3dc; --field: #25272a; --line: #4a4d52; }
+  :root:has(#theme:checked) { color-scheme: light; --bg: #f6f1e4; --fg: #2a2824; --field: #fffdf7; --line: #d6cfbd; }
+}
+@media (prefers-color-scheme: light) {
+  :root:has(#theme:checked) { color-scheme: dark; --bg: #2e3033; --fg: #e6e3dc; --field: #25272a; --line: #4a4d52; }
+}
+body { max-width: 70ch; margin: 0 auto; padding: 3em 1em; font: 1.1rem/1.6 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+h1, h2 { line-height: 1.2; }
+h2 { margin-top: 2em; }
+label { display: block; margin-top: 1em; }
+textarea, input[type=text] { width: 100%; box-sizing: border-box; padding: .5em; font: .85rem ui-monospace, monospace; color: inherit; background: var(--field); border: 1px solid var(--line); border-radius: 4px; }
+button { font: inherit; padding: .4em 1.2em; }
+[role=status] { font-size: .9rem; opacity: .75; }
+#theme-switch { position: absolute; top: .5em; right: 1em; margin: 0; font-size: 1.3rem; cursor: pointer; opacity: .6; }
+#theme-switch:hover, #theme-switch:has(:focus-visible) { opacity: 1; }
+#theme { position: absolute; opacity: 0; }
