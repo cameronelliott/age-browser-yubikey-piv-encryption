@@ -1,4 +1,4 @@
-# age encrypt
+# age encrypt for YubiKey PIV
 
 A single HTML file that encrypts secrets with [age](https://age-encryption.org),
 to ordinary `age1...` recipients and to `age1yubikey1...` recipients from
